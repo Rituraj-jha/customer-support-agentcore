@@ -1,0 +1,19 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to ECR...
+      - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 815817732360.dkr.ecr.us-east-1.amazonaws.com
+
+  build:
+    commands:
+      - echo Building ARM64 image...
+      - docker build -t customer-support-agentcore:latest .
+
+      - docker tag customer-support-agentcore:latest 815817732360.dkr.ecr.us-east-1.amazonaws.com/customer-support-agentcore:latest
+
+  post_build:
+    commands:
+      - echo Pushing image...
+      - docker push 815817732360.dkr.ecr.us-east-1.amazonaws.com/customer-support-agentcore:latest
