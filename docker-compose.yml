@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: support-agentcore-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: langgraph
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d langgraph"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: support-agentcore-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:-us.amazon.nova-micro-v1:0}
+      POSTGRES_CHECKPOINT_DSN: ${POSTGRES_CHECKPOINT_DSN:-postgresql://postgres:postgres@postgres:5432/langgraph}
+      ALLOW_INMEMORY_CHECKPOINTER: "false"
+      AGENTCORE_MEMORY_ENDPOINT: ${AGENTCORE_MEMORY_ENDPOINT:-}
+      AGENTCORE_MEMORY_API_KEY: ${AGENTCORE_MEMORY_API_KEY:-}
+      BEDROCK_DEBUG_ERRORS: ${BEDROCK_DEBUG_ERRORS:-false}
+      REFUND_APPROVAL_THRESHOLD: ${REFUND_APPROVAL_THRESHOLD:-100}
+      PORT: 8080
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
