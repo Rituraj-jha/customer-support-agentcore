@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Literal
@@ -18,6 +20,9 @@ from src.services.memory_service import MemoryService
 from src.services.postgres import checkpointer_from_env
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class StartWorkflowRequest(BaseModel):
@@ -66,6 +71,13 @@ class InvocationResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Starting application")
+    logger.info("BEDROCK_MODEL_ID=%s", os.getenv("BEDROCK_MODEL_ID"))
+    logger.info(
+        "POSTGRES_CHECKPOINT_DSN exists=%s",
+        bool(os.getenv("POSTGRES_CHECKPOINT_DSN")),
+    )
+
     llm_service = BedrockLLMService.from_env()
     memory_service = MemoryService()
     knowledge_service = KnowledgeBaseService.default()
@@ -96,6 +108,35 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    try:
+        logger.info(
+            "REQUEST method=%s path=%s",
+            request.method,
+            request.url.path,
+        )
+
+        response = await call_next(request)
+
+        logger.info(
+            "RESPONSE method=%s path=%s status=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+        )
+
+        return response
+
+    except Exception:
+        logger.exception(
+            "UNHANDLED EXCEPTION method=%s path=%s",
+            request.method,
+            request.url.path,
+        )
+        raise
+
+
 def _base_state(payload: StartWorkflowRequest) -> dict[str, Any]:
     return {
         "session_id": payload.session_id,
@@ -124,15 +165,28 @@ def execute_workflow(
     base_state: dict[str, Any] | None = None,
     resume_decision: str | None = None,
 ) -> dict[str, Any]:
-    graph = app.state.graph
-    config = {"configurable": {"thread_id": thread_id}}
+    logger.info(
+        "execute_workflow thread_id=%s resume=%s",
+        thread_id,
+        resume_decision,
+    )
 
-    if resume_decision is not None:
-        return graph.invoke(Command(resume={"decision": resume_decision}), config=config)
+    try:
+        graph = app.state.graph
+        config = {"configurable": {"thread_id": thread_id}}
 
-    if base_state is None:
-        raise ValueError("base_state is required when resume_decision is not provided")
-    return graph.invoke(base_state, config=config)
+        if resume_decision is not None:
+            return graph.invoke(Command(resume={"decision": resume_decision}), config=config)
+
+        if base_state is None:
+            raise ValueError("base_state is required when resume_decision is not provided")
+        return graph.invoke(base_state, config=config)
+    except Exception:
+        logger.exception(
+            "execute_workflow failed thread_id=%s",
+            thread_id,
+        )
+        raise
 
 
 def _response_from_result(thread_id: str, result: dict[str, Any]) -> WorkflowResponse:
@@ -237,45 +291,90 @@ def submit_approval(payload: ApprovalRequest) -> WorkflowResponse:
 @app.post("/invocations", response_model=InvocationResponse)
 async def invoke(request: Request) -> InvocationResponse:
     try:
-        body = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+        try:
+            body = await request.json()
+        except Exception as exc:
+            logger.exception("ERROR INSIDE /invocations: invalid JSON body")
+            raise HTTPException(status_code=400, detail="invalid JSON body") from exc
 
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="request body must be a JSON object")
+        if not isinstance(body, dict):
+            logger.exception("ERROR INSIDE /invocations: request body must be a JSON object")
+            raise HTTPException(status_code=400, detail="request body must be a JSON object")
 
-    print("===================================")
-    print("AGENTCORE REQUEST RECEIVED")
-    print(body)
-    print("===================================")
+        normalized_body = _normalize_agentcore_payload(body)
 
-    normalized_body = _normalize_agentcore_payload(body)
+        try:
+            payload = InvocationRequest(**normalized_body)
+        except Exception as exc:
+            logger.exception("ERROR INSIDE /invocations: invalid invocation payload")
+            raise HTTPException(status_code=400, detail=f"invalid invocation payload: {exc}") from exc
 
-    try:
-        payload = InvocationRequest(**normalized_body)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"invalid invocation payload: {exc}") from exc
+        logger.info("INVOCATION PAYLOAD: %s", payload.model_dump())
 
-    thread_id = payload.thread_id or payload.session_id
-    action = (payload.action or "").strip().lower()
+        thread_id = payload.thread_id or payload.session_id
+        action = (payload.action or "").strip().lower()
 
-    if action == "resume":
-        decision = (payload.decision or "").strip().lower()
-        if decision not in {"approve", "approved", "reject", "rejected"}:
-            raise HTTPException(status_code=400, detail="decision must be approve or reject")
+        logger.info(
+            "thread_id=%s action=%s",
+            thread_id,
+            action,
+        )
 
-        result = execute_workflow(thread_id=thread_id, resume_decision=decision)
-        return _invocation_response_from_result(payload.session_id, thread_id, result)
+        if action == "resume":
+            decision = (payload.decision or "").strip().lower()
 
-    start_payload = StartWorkflowRequest(
-        session_id=payload.session_id,
-        user_id=payload.user_id,
-        message=payload.message,
-        request_metadata=payload.request_metadata,
-        thread_id=thread_id,
-    )
-    result = execute_workflow(thread_id=thread_id, base_state=_base_state(start_payload))
-    return _invocation_response_from_result(payload.session_id, thread_id, result)
+            logger.info("resume decision=%s", decision)
+
+            if decision not in {
+                "approve",
+                "approved",
+                "reject",
+                "rejected",
+            }:
+                raise HTTPException(
+                    status_code=400,
+                    detail="decision must be approve or reject",
+                )
+
+            result = execute_workflow(
+                thread_id=thread_id,
+                resume_decision=decision,
+            )
+
+            logger.info("workflow result=%s", result)
+
+            return _invocation_response_from_result(
+                payload.session_id,
+                thread_id,
+                result,
+            )
+
+        start_payload = StartWorkflowRequest(
+            session_id=payload.session_id,
+            user_id=payload.user_id,
+            message=payload.message,
+            request_metadata=payload.request_metadata,
+            thread_id=thread_id,
+        )
+
+        logger.info("starting workflow")
+
+        result = execute_workflow(
+            thread_id=thread_id,
+            base_state=_base_state(start_payload),
+        )
+
+        logger.info("workflow result=%s", result)
+
+        return _invocation_response_from_result(
+            payload.session_id,
+            thread_id,
+            result,
+        )
+
+    except Exception:
+        logger.exception("ERROR INSIDE /invocations")
+        raise
 
 
 @app.get("/workflow/state/{thread_id}")
