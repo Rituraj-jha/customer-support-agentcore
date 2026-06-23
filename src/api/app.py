@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -212,7 +212,15 @@ def submit_approval(payload: ApprovalRequest) -> WorkflowResponse:
 
 
 @app.post("/invocations", response_model=InvocationResponse)
-def invoke(payload: InvocationRequest) -> InvocationResponse:
+async def invoke(request: Request) -> InvocationResponse:
+    body = await request.json()
+
+    print("===================================")
+    print("AGENTCORE REQUEST RECEIVED")
+    print(body)
+    print("===================================")
+
+    payload = InvocationRequest(**body)
     thread_id = payload.thread_id or payload.session_id
     action = (payload.action or "").strip().lower()
 
