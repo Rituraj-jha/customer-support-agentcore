@@ -216,3 +216,19 @@ def test_interrupt_payload_structure():
     assert interrupt.get("type") == "human_approval_required"
     assert interrupt.get("thread_id") == "demo-refund-hi-3"
     assert set(interrupt.get("decision_options", [])) == {"approve", "reject"}
+
+
+def test_invocations_accepts_prompt_only_shape():
+    with _client() as client:
+        response = client.post(
+            "/invocations",
+            json={
+                "prompt": "Tell me about your premium support plan",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["session_id"].startswith("agentcore-")
+    assert payload["workflow_status"] == "memory_updated"
+    assert payload["metadata"]["intent"] == "product_information"

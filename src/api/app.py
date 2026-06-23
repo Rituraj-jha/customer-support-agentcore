@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
@@ -178,6 +179,28 @@ def _invocation_response_from_result(
     )
 
 
+def _normalize_agentcore_payload(body: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(body)
+
+    prompt_value = normalized.get("prompt")
+    message_value = normalized.get("message")
+    if message_value is None and prompt_value is not None:
+        normalized["message"] = str(prompt_value)
+
+    session_id = normalized.get("session_id")
+    thread_id = normalized.get("thread_id")
+    if not session_id:
+        normalized["session_id"] = str(thread_id or f"agentcore-{uuid.uuid4().hex[:12]}")
+
+    if not normalized.get("user_id"):
+        normalized["user_id"] = "agentcore-user"
+
+    if normalized.get("request_metadata") is None:
+        normalized["request_metadata"] = {}
+
+    return normalized
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -213,14 +236,26 @@ def submit_approval(payload: ApprovalRequest) -> WorkflowResponse:
 
 @app.post("/invocations", response_model=InvocationResponse)
 async def invoke(request: Request) -> InvocationResponse:
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON body") from exc
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="request body must be a JSON object")
 
     print("===================================")
     print("AGENTCORE REQUEST RECEIVED")
     print(body)
     print("===================================")
 
-    payload = InvocationRequest(**body)
+    normalized_body = _normalize_agentcore_payload(body)
+
+    try:
+        payload = InvocationRequest(**normalized_body)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid invocation payload: {exc}") from exc
+
     thread_id = payload.thread_id or payload.session_id
     action = (payload.action or "").strip().lower()
 

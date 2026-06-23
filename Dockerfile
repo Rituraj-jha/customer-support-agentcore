@@ -1,7 +1,8 @@
 FROM public.ecr.aws/docker/library/python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    APP_MODULE=src.api.app:app
 
 WORKDIR /app
 
@@ -17,4 +18,4 @@ COPY README.md ./README.md
 
 EXPOSE 8080
 
-CMD ["uvicorn", "src.api.app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["sh", "-c", "uvicorn ${APP_MODULE} --host 0.0.0.0 --port 8080"]

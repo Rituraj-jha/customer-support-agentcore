@@ -78,6 +78,16 @@ Supported AgentCore contract endpoints:
 - `GET /ping`
 - `POST /invocations`
 
+The `/invocations` endpoint accepts both payload shapes:
+
+- Workflow shape: `session_id`, `user_id`, `message`, optional `request_metadata`
+- AgentCore-style minimal shape: `prompt` (auto-mapped to `message`)
+
+When minimal shape is used, defaults are applied:
+
+- `session_id` defaults to `thread_id` or generated runtime id
+- `user_id` defaults to `agentcore-user`
+
 ### Example invocation request
 
 ```json
@@ -244,6 +254,31 @@ uvicorn src.api.app:app --host 0.0.0.0 --port 8080
 - Bedrock model endpoint in your region
 - PostgreSQL checkpoint database
 - AgentCore Memory endpoint
+
+## 8.1 Diagnostic Runtime Mode
+
+To verify AgentCore request reachability, you can run a minimal diagnostic runtime
+that logs all requests and includes a catch-all route.
+
+When using Docker, switch the app module at runtime:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e APP_MODULE=src.api.diagnostic_app:app \
+  support-agentcore:latest
+```
+
+When using Docker Compose:
+
+```bash
+APP_MODULE=src.api.diagnostic_app:app docker compose up --build -d
+```
+
+The diagnostic runtime includes:
+
+- `GET /ping`
+- `POST /invocations`
+- catch-all `/{path:path}` for all common HTTP methods
 
 ## 10. Durability Restart Demo Using Docker Compose
 
