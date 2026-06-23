@@ -78,14 +78,21 @@ async def lifespan(app: FastAPI):
         bool(os.getenv("POSTGRES_CHECKPOINT_DSN")),
     )
 
+    logger.info("Creating Bedrock service")
     llm_service = BedrockLLMService.from_env()
+
+    logger.info("Creating Memory service")
     memory_service = MemoryService()
+
+    logger.info("Creating Knowledge service")
     knowledge_service = KnowledgeBaseService.default()
     refund_threshold = float(os.getenv("REFUND_APPROVAL_THRESHOLD", "100"))
 
+    logger.info("Creating Checkpointer")
     checkpoint_cm = checkpointer_from_env()
     checkpointer = checkpoint_cm.__enter__()
 
+    logger.info("Building graph")
     app.state.graph = build_support_graph(
         llm_service=llm_service,
         memory_service=memory_service,
@@ -93,6 +100,10 @@ async def lifespan(app: FastAPI):
         refund_threshold=refund_threshold,
         checkpointer=checkpointer,
     )
+    logger.info("Graph built successfully")
+    logger.info("Application startup completed")
+    logger.info("Graph object type=%s", type(app.state.graph))
+
     app.state.checkpoint_cm = checkpoint_cm
 
     try:
@@ -109,7 +120,7 @@ app = FastAPI(
 
 
 @app.middleware("http")
-async def request_logging_middleware(request: Request, call_next):
+async def log_exceptions(request: Request, call_next):
     try:
         logger.info(
             "REQUEST method=%s path=%s",
@@ -165,27 +176,29 @@ def execute_workflow(
     base_state: dict[str, Any] | None = None,
     resume_decision: str | None = None,
 ) -> dict[str, Any]:
-    logger.info(
-        "execute_workflow thread_id=%s resume=%s",
-        thread_id,
-        resume_decision,
-    )
+    graph = app.state.graph
+    config = {"configurable": {"thread_id": thread_id}}
 
     try:
-        graph = app.state.graph
-        config = {"configurable": {"thread_id": thread_id}}
+        logger.info(
+            "execute_workflow thread_id=%s resume=%s",
+            thread_id,
+            resume_decision,
+        )
 
         if resume_decision is not None:
-            return graph.invoke(Command(resume={"decision": resume_decision}), config=config)
+            result = graph.invoke(
+                Command(resume={"decision": resume_decision}),
+                config=config,
+            )
+        else:
+            result = graph.invoke(base_state, config=config)
 
-        if base_state is None:
-            raise ValueError("base_state is required when resume_decision is not provided")
-        return graph.invoke(base_state, config=config)
+        logger.info("graph.invoke completed")
+        return result
+
     except Exception:
-        logger.exception(
-            "execute_workflow failed thread_id=%s",
-            thread_id,
-        )
+        logger.exception("graph.invoke FAILED")
         raise
 
 
