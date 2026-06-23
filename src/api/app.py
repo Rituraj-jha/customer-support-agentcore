@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -17,7 +18,11 @@ from src.graph import build_support_graph
 from src.services.bedrock import BedrockLLMService
 from src.services.knowledge_base import KnowledgeBaseService
 from src.services.memory_service import MemoryService
-from src.services.postgres import checkpointer_from_env
+from src.services.postgres import (
+    checkpointer_from_env,
+    normalize_postgres_dsn,
+    postgres_dsn_details,
+)
 
 load_dotenv()
 
@@ -73,10 +78,35 @@ class InvocationResponse(BaseModel):
 async def lifespan(app: FastAPI):
     logger.info("Starting application")
     logger.info("BEDROCK_MODEL_ID=%s", os.getenv("BEDROCK_MODEL_ID"))
-    logger.info(
-        "POSTGRES_CHECKPOINT_DSN exists=%s",
-        bool(os.getenv("POSTGRES_CHECKPOINT_DSN")),
-    )
+    raw_dsn = os.getenv("POSTGRES_CHECKPOINT_DSN", "").strip()
+    logger.info("POSTGRES_CHECKPOINT_DSN exists=%s", bool(raw_dsn))
+
+    if raw_dsn:
+        dsn_details = postgres_dsn_details(raw_dsn)
+        logger.info(
+            "Postgres host=%s port=%s db=%s sslmode=%s",
+            dsn_details.get("host"),
+            dsn_details.get("port"),
+            dsn_details.get("database"),
+            dsn_details.get("sslmode"),
+        )
+
+        normalized_dsn = normalize_postgres_dsn(raw_dsn)
+        if normalized_dsn != raw_dsn:
+            os.environ["POSTGRES_CHECKPOINT_DSN"] = normalized_dsn
+            logger.info("POSTGRES_CHECKPOINT_DSN missing sslmode; appending sslmode=require")
+
+        logger.info("Testing PostgreSQL connectivity")
+        try:
+            import psycopg
+
+            with psycopg.connect(normalized_dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT current_database(), current_user")
+                    result = cur.fetchone()
+                    logger.info("Database connectivity successful: %s", result)
+        except Exception:
+            logger.exception("PostgreSQL connectivity validation failed")
 
     logger.info("Creating Bedrock service")
     llm_service = BedrockLLMService.from_env()
@@ -88,18 +118,31 @@ async def lifespan(app: FastAPI):
     knowledge_service = KnowledgeBaseService.default()
     refund_threshold = float(os.getenv("REFUND_APPROVAL_THRESHOLD", "100"))
 
-    logger.info("Creating Checkpointer")
+    logger.info("Creating PostgreSQL checkpointer")
     checkpoint_cm = checkpointer_from_env()
     checkpointer = checkpoint_cm.__enter__()
+    logger.info(
+        "PostgreSQL checkpointer created successfully. Type=%s",
+        type(checkpointer),
+    )
 
     logger.info("Building graph")
-    app.state.graph = build_support_graph(
-        llm_service=llm_service,
-        memory_service=memory_service,
-        knowledge_service=knowledge_service,
-        refund_threshold=refund_threshold,
-        checkpointer=checkpointer,
-    )
+    if os.getenv("DISABLE_CHECKPOINTER", "").lower() == "true":
+        app.state.graph = build_support_graph(
+            llm_service=llm_service,
+            memory_service=memory_service,
+            knowledge_service=knowledge_service,
+            refund_threshold=refund_threshold,
+            checkpointer=None,
+        )
+    else:
+        app.state.graph = build_support_graph(
+            llm_service=llm_service,
+            memory_service=memory_service,
+            knowledge_service=knowledge_service,
+            refund_threshold=refund_threshold,
+            checkpointer=checkpointer,
+        )
     logger.info("Graph built successfully")
     logger.info("Application startup completed")
     logger.info("Graph object type=%s", type(app.state.graph))
@@ -186,6 +229,15 @@ def execute_workflow(
             resume_decision,
         )
 
+        session_id = None
+        if isinstance(base_state, dict):
+            session_id = base_state.get("session_id")
+
+        logger.info("About to invoke graph")
+        logger.info("Session ID=%s", session_id)
+        logger.info("Config=%s", config)
+        logger.info("Checkpoint read starting")
+
         if resume_decision is not None:
             result = graph.invoke(
                 Command(resume={"decision": resume_decision}),
@@ -194,11 +246,11 @@ def execute_workflow(
         else:
             result = graph.invoke(base_state, config=config)
 
-        logger.info("graph.invoke completed")
+        logger.info("Graph invoke succeeded")
         return result
 
     except Exception:
-        logger.exception("graph.invoke FAILED")
+        logger.exception("Graph invoke failed")
         raise
 
 
@@ -304,17 +356,20 @@ def submit_approval(payload: ApprovalRequest) -> WorkflowResponse:
 @app.post("/invocations", response_model=InvocationResponse)
 async def invoke(request: Request) -> InvocationResponse:
     try:
+        body = await request.body()
+        logger.info("RAW INVOCATION BODY=%s", body.decode("utf-8", errors="replace"))
+
         try:
-            body = await request.json()
+            payload_dict = json.loads(body or b"{}")
         except Exception as exc:
             logger.exception("ERROR INSIDE /invocations: invalid JSON body")
             raise HTTPException(status_code=400, detail="invalid JSON body") from exc
 
-        if not isinstance(body, dict):
+        if not isinstance(payload_dict, dict):
             logger.exception("ERROR INSIDE /invocations: request body must be a JSON object")
             raise HTTPException(status_code=400, detail="request body must be a JSON object")
 
-        normalized_body = _normalize_agentcore_payload(body)
+        normalized_body = _normalize_agentcore_payload(payload_dict)
 
         try:
             payload = InvocationRequest(**normalized_body)
@@ -322,6 +377,8 @@ async def invoke(request: Request) -> InvocationResponse:
             logger.exception("ERROR INSIDE /invocations: invalid invocation payload")
             raise HTTPException(status_code=400, detail=f"invalid invocation payload: {exc}") from exc
 
+        logger.info("INVOCATION PAYLOAD RECEIVED")
+        logger.info(payload.model_dump())
         logger.info("INVOCATION PAYLOAD: %s", payload.model_dump())
 
         thread_id = payload.thread_id or payload.session_id

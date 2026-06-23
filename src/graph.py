@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
@@ -20,6 +22,9 @@ from src.nodes.retrieval import retrieve_knowledge
 from src.nodes.technical import technical_support_node
 from src.nodes.validation import validate_request, validation_failure_response
 from src.state import SupportState
+
+
+logger = logging.getLogger(__name__)
 
 
 def _route_after_validation(state: SupportState) -> Literal[
@@ -125,4 +130,11 @@ def build_support_graph(
     builder.add_edge("ensure_response", "persist_memory")
     builder.add_edge("persist_memory", END)
 
-    return builder.compile(checkpointer=checkpointer)
+    logger.info("Checkpointer type=%s", type(checkpointer))
+
+    if os.getenv("DISABLE_CHECKPOINTER", "").lower() == "true":
+        graph = builder.compile()
+    else:
+        graph = builder.compile(checkpointer=checkpointer)
+
+    return graph
