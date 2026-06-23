@@ -210,13 +210,107 @@ def _base_state(payload: StartWorkflowRequest) -> dict[str, Any]:
     }
 
 
+def _invoke_workflow_with_fresh_checkpointer(
+    *,
+    thread_id: str,
+    base_state: dict[str, Any] | None = None,
+    resume_decision: str | None = None,
+) -> dict[str, Any]:
+    """Per-request test: create fresh checkpointer+graph, invoke, close."""
+    logger.info("REBUILD_GRAPH_PER_REQUEST=true; creating fresh checkpointer for thread_id=%s", thread_id)
+    
+    try:
+        checkpoint_resource_fresh = checkpointer_from_env()
+        checkpointer_fresh = checkpoint_resource_fresh.checkpointer
+        
+        logger.info("Fresh checkpointer type=%s", type(checkpointer_fresh))
+        
+        try:
+            conn_fresh = getattr(checkpointer_fresh, "conn", None)
+            if conn_fresh is not None:
+                logger.info("Fresh conn.closed=%s", getattr(conn_fresh, "closed", "missing"))
+                logger.info("Fresh conn.broken=%s", getattr(conn_fresh, "broken", "missing"))
+        except Exception as e:
+            logger.warning("Fresh connection introspection failed: %s", e)
+        
+        llm_service = BedrockLLMService.from_env()
+        memory_service = MemoryService()
+        knowledge_service = KnowledgeBaseService.default()
+        refund_threshold = float(os.getenv("REFUND_APPROVAL_THRESHOLD", "100"))
+        
+        graph_fresh = build_support_graph(
+            llm_service=llm_service,
+            memory_service=memory_service,
+            knowledge_service=knowledge_service,
+            refund_threshold=refund_threshold,
+            checkpointer=checkpointer_fresh,
+        )
+        
+        logger.info("Fresh graph compiled successfully")
+        
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        try:
+            if resume_decision is not None:
+                result = graph_fresh.invoke(
+                    Command(resume={"decision": resume_decision}),
+                    config=config,
+                )
+            else:
+                result = graph_fresh.invoke(base_state, config=config)
+            
+            logger.info("Fresh graph invoke succeeded")
+            return result
+        
+        finally:
+            logger.info("Closing fresh checkpointer")
+            checkpoint_resource_fresh.close()
+            logger.info("Fresh checkpointer closed")
+    
+    except Exception:
+        logger.exception("Fresh checkpointer invoke failed")
+        raise
+
+
 def execute_workflow(
     *,
     thread_id: str,
     base_state: dict[str, Any] | None = None,
     resume_decision: str | None = None,
 ) -> dict[str, Any]:
+    # Check if per-request rebuild mode is enabled
+    if os.getenv("REBUILD_GRAPH_PER_REQUEST", "").lower() == "true":
+        return _invoke_workflow_with_fresh_checkpointer(
+            thread_id=thread_id,
+            base_state=base_state,
+            resume_decision=resume_decision,
+        )
+    
     graph = app.state.graph
+    checkpoint_resource = getattr(app.state, "checkpoint_resource", None)
+    checkpointer = getattr(checkpoint_resource, "checkpointer", None)
+    
+    logger.info("checkpointer=%s", checkpointer)
+    logger.info("checkpointer_type=%s", type(checkpointer))
+    
+    if checkpointer is not None:
+        try:
+            logger.info("checkpointer_dict=%s", vars(checkpointer))
+        except Exception as e:
+            logger.warning("checkpointer vars introspection failed: %s", e)
+        
+        try:
+            conn = getattr(checkpointer, "conn", None)
+            if conn is not None:
+                logger.info("underlying_conn=%s", conn)
+                logger.info("underlying_conn_type=%s", type(conn))
+                is_closed = getattr(conn, "closed", None)
+                logger.info("underlying_conn_closed=%s", is_closed)
+                logger.info("conn.closed=%s", getattr(conn, "closed", "missing"))
+                logger.info("conn.broken=%s", getattr(conn, "broken", "missing"))
+        except Exception as e:
+            logger.warning("underlying connection introspection failed: %s", e)
+    
     config = {"configurable": {"thread_id": thread_id}}
 
     try:
@@ -230,9 +324,12 @@ def execute_workflow(
         if isinstance(base_state, dict):
             session_id = base_state.get("session_id")
 
+        logger.info("Executing graph.invoke")
+        logger.info("Thread id=%s", thread_id)
         logger.info("About to invoke graph thread_id=%s", thread_id)
         logger.info("Session ID=%s", session_id)
         logger.info("Config=%s", config)
+        logger.info("Checkpointer object=%s", checkpointer)
         logger.info("Checkpoint read starting")
 
         if resume_decision is not None:
@@ -328,6 +425,30 @@ def ping() -> dict[str, Any]:
         "status": "Healthy",
         "time_of_last_update": int(time.time()),
     }
+
+
+@app.get("/debug/checkpointer")
+def debug_checkpointer() -> dict[str, Any]:
+    """Debug endpoint to inspect checkpointer connection state."""
+    checkpoint_resource = getattr(app.state, "checkpoint_resource", None)
+    checkpointer = getattr(checkpoint_resource, "checkpointer", None)
+    
+    result: dict[str, Any] = {
+        "checkpointer_type": str(type(checkpointer)),
+        "checkpointer_exists": checkpointer is not None,
+    }
+    
+    if checkpointer is not None:
+        try:
+            conn = getattr(checkpointer, "conn", None)
+            result["connection_exists"] = conn is not None
+            if conn is not None:
+                result["connection_type"] = str(type(conn))
+                result["connection_closed"] = getattr(conn, "closed", None)
+        except Exception as e:
+            result["connection_check_error"] = str(e)
+    
+    return result
 
 
 @app.post("/workflow/start", response_model=WorkflowResponse)
