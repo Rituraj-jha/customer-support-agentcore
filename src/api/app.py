@@ -77,6 +77,7 @@ class InvocationResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting application")
+    logger.info("Process PID=%s", os.getpid())
     logger.info("BEDROCK_MODEL_ID=%s", os.getenv("BEDROCK_MODEL_ID"))
     raw_dsn = os.getenv("POSTGRES_CHECKPOINT_DSN", "").strip()
     logger.info("POSTGRES_CHECKPOINT_DSN exists=%s", bool(raw_dsn))
@@ -102,9 +103,9 @@ async def lifespan(app: FastAPI):
 
             with psycopg.connect(normalized_dsn) as conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT current_database(), current_user")
-                    result = cur.fetchone()
-                    logger.info("Database connectivity successful: %s", result)
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                    logger.info("Database connectivity test successful")
         except Exception:
             logger.exception("PostgreSQL connectivity validation failed")
 
@@ -118,13 +119,9 @@ async def lifespan(app: FastAPI):
     knowledge_service = KnowledgeBaseService.default()
     refund_threshold = float(os.getenv("REFUND_APPROVAL_THRESHOLD", "100"))
 
-    logger.info("Creating PostgreSQL checkpointer")
-    checkpoint_cm = checkpointer_from_env()
-    checkpointer = checkpoint_cm.__enter__()
-    logger.info(
-        "PostgreSQL checkpointer created successfully. Type=%s",
-        type(checkpointer),
-    )
+    checkpoint_resource = checkpointer_from_env()
+    checkpointer = checkpoint_resource.checkpointer
+    logger.info("Checkpointer type=%s", type(checkpointer))
 
     logger.info("Building graph")
     if os.getenv("DISABLE_CHECKPOINTER", "").lower() == "true":
@@ -147,12 +144,12 @@ async def lifespan(app: FastAPI):
     logger.info("Application startup completed")
     logger.info("Graph object type=%s", type(app.state.graph))
 
-    app.state.checkpoint_cm = checkpoint_cm
+    app.state.checkpoint_resource = checkpoint_resource
 
     try:
         yield
     finally:
-        checkpoint_cm.__exit__(None, None, None)
+        checkpoint_resource.close()
 
 
 app = FastAPI(
@@ -233,7 +230,7 @@ def execute_workflow(
         if isinstance(base_state, dict):
             session_id = base_state.get("session_id")
 
-        logger.info("About to invoke graph")
+        logger.info("About to invoke graph thread_id=%s", thread_id)
         logger.info("Session ID=%s", session_id)
         logger.info("Config=%s", config)
         logger.info("Checkpoint read starting")
@@ -250,7 +247,7 @@ def execute_workflow(
         return result
 
     except Exception:
-        logger.exception("Graph invoke failed")
+        logger.exception("Graph invocation failed")
         raise
 
 
